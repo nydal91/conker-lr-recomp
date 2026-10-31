@@ -3470,6 +3470,7 @@ static int ready(void)
 /* Submit what is recorded and wait for it, then keep recording in the same
  * frame (ring full). */
 static void present_drain(void);
+static void submit_failed(VkResult r, const char *where);
 static void flush_frame_wait(void)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -3480,7 +3481,11 @@ static void flush_frame_wait(void)
     vkEndCommandBuffer(s_cb);
     si.commandBufferCount = 1;
     si.pCommandBuffers = &s_cb;
-    vkQueueSubmit(s_queue, 1, &si, s_f->fence);
+    {
+        VkResult r = vkQueueSubmit(s_queue, 1, &si, s_f->fence);
+        if (r != VK_SUCCESS)
+            submit_failed(r, "mid-frame flush");
+    }
     vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
     vkResetFences(s_dev, 1, &s_f->fence);
     garbage_free(s_f);
@@ -3507,6 +3512,13 @@ static void flush_frame_wait(void)
  * which covers everything submitted before it. */
 static int s_kick_n = -1;
 
+/* The queue is externally synchronized: present_thread's vkQueuePresentKHR
+ * and kick_submit's vkQueueSubmit take this. The other submits wait for the
+ * present first (present_drain). Without it an early submit could meet a
+ * present on the worker -- in a loading frame of 14000 draws and ~45 kicks
+ * on an Adreno 740, the device was lost and every later submit failed. */
+static pthread_mutex_t s_queue_m = PTHREAD_MUTEX_INITIALIZER;
+
 static int kick_due(int mid_pass)
 {
     if (s_kick_n < 0) {
@@ -3525,13 +3537,18 @@ static void kick_submit(void)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    VkResult r;
     end_rendering();
     s_rt = NULL;
     s_rt_depth = NULL;
     vkEndCommandBuffer(s_cb);
     si.commandBufferCount = 1;
     si.pCommandBuffers = &s_cb;
-    vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
+    pthread_mutex_lock(&s_queue_m);
+    r = vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
+    pthread_mutex_unlock(&s_queue_m);
+    if (r != VK_SUCCESS)
+        submit_failed(r, "early submit");
     s_cb = s_f->cbs[++s_f->ncb];
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s_cb, &bi);
@@ -5397,13 +5414,25 @@ static void *present_thread(void *arg)
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swapchain;
         pi.pImageIndices = &idx;
+        pthread_mutex_lock(&s_queue_m);
         r = vkQueuePresentKHR(s_queue, &pi);
+        pthread_mutex_unlock(&s_queue_m);
         pthread_mutex_lock(&s_pres.m);
         s_pres.result = r;
         s_pres.done = 1;
         pthread_cond_broadcast(&s_pres.c);
     }
     return NULL;
+}
+
+/* A failed submit: the code, where, and the frame the first time; then a
+ * count every 600 (it was 8700 bare lines once the device was lost). */
+static void submit_failed(VkResult r, const char *where)
+{
+    static unsigned n;
+    if (n++ % 600 == 0)
+        LOGE("vkQueueSubmit failed (%s, VkResult %d%s), frame %u, %u so far\n", where, (int)r,
+             r == VK_ERROR_DEVICE_LOST ? ": device lost" : "", s_frame, n);
 }
 
 static void present_result(VkResult r, uint32_t pw, uint32_t ph)
@@ -5804,8 +5833,11 @@ static void vk_flip(void)
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s_sc_rendered[idx];
     }
-    if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS)
-        LOGE("vkQueueSubmit failed\n");
+    {
+        VkResult r = vkQueueSubmit(s_queue, 1, &si, s_f->fence);
+        if (r != VK_SUCCESS)
+            submit_failed(r, "flip");
+    }
     s_f->submitted = 1;
     if (recomp_lat_on()) {
         lat_poll();
