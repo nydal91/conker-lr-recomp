@@ -30,6 +30,7 @@
 #include "guest_vmem.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
+#include <time.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
  * to 32 bits and sign-extended it into a `struct bridge_thread_start *`. Every
@@ -647,6 +648,37 @@ static volatile uint64_t  s_gil_next, s_gil_serving;
 static volatile int       s_gil_on = -1;
 /* t_gil_depth: declared with the thread registry */
 
+/* RECOMP_IRQ_SPIN=<us> (0 = off): how long a thread handing work to another
+ * polls before it sleeps. Conker posts ~50 NOP traps a frame, each a round
+ * trip executor -> interrupt thread -> guest lock -> executor; on Android
+ * every sleep-and-wake there cost 25-100 us (~200 us a trap, 11 ms of a
+ * 33 ms frame: Hungover at 30 fps on a Snapdragon 8 Gen 2, 60 with 1000).
+ * The interrupt thread then spins most of the time, a core of its own: the
+ * default on Android only (a Switch has three). Exported for nv2a_pb_exec.c. */
+uint64_t xbox_irq_spin_ns(void)
+{
+    static int64_t ns = -1;
+    if (ns < 0) {
+        const char *e = getenv("RECOMP_IRQ_SPIN");
+#if defined(__ANDROID__)
+        int dflt = 1000;
+#else
+        int dflt = 0;
+#endif
+        ns = (int64_t)(e ? atoi(e) : dflt) * 1000;
+        if (ns < 0) ns = 0;
+        fprintf(stderr, "  [THREAD] hand-off spin %lld us (RECOMP_IRQ_SPIN)\n", (long long)(ns / 1000));
+    }
+    return (uint64_t)ns;
+}
+
+static uint64_t spin_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static int gil_enabled(void)
 {
     if (s_gil_on < 0) {
@@ -737,9 +769,20 @@ static void gil_lock(void)
             g_gil_contended = 1;
     }
     /* A thread at DISPATCH (an ISR/DPC, or a raised section) runs before
-     * anything below it on the Xbox: ask for the lock at once. */
+     * anything below it on the Xbox: ask for the lock at once -- and poll
+     * for it a while (RECOMP_IRQ_SPIN) instead of sleeping on the condition
+     * variable, whose wake-up was most of a NOP trap's delivery. */
     if (me != s_gil_serving && xbox_thread_holds_dispatch()) {
+        uint64_t spin = xbox_irq_spin_ns();
         g_gil_contended = 1;
+        if (spin) {
+            uint64_t t0 = spin_now_ns();
+            LeaveCriticalSection(&s_gil_cs);
+            while (__atomic_load_n(&s_gil_serving, __ATOMIC_ACQUIRE) != me
+                   && spin_now_ns() - t0 < spin)
+                ;
+            EnterCriticalSection(&s_gil_cs);
+        }
     }
     while (me != s_gil_serving)
         if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
@@ -3417,13 +3460,42 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        /* a device interrupt, the next vblank, or 10 ms */
-        WaitForSingleObject(xbox_irq_line_event(), kernel_vblank_wait_ms());
+        /* a device interrupt, the next vblank, or 10 ms. Right after an
+         * interrupt, poll for the next one a while first (RECOMP_IRQ_SPIN):
+         * NOP traps come in bursts, and each wake-up from the sleep cost
+         * ~100 us on Android. */
+        {
+            static uint64_t last_irq;
+            uint64_t spin = xbox_irq_spin_ns(), t0 = spin_now_ns();
+            extern volatile uint64_t g_irq_idle_ns;
+            g_irq_idle_ns = t0;
+            int got = 0;
+            if (spin && t0 - last_irq < 2000000)
+                while (!(got = WaitForSingleObject(xbox_irq_line_event(), 0) == WAIT_OBJECT_0)
+                       && spin_now_ns() - t0 < spin)
+                    ;
+            if (!got)
+                got = WaitForSingleObject(xbox_irq_line_event(), kernel_vblank_wait_ms()) == WAIT_OBJECT_0;
+            if (got && xbox_irq_lines())
+                last_irq = spin_now_ns();
+        }
+        {   /* RECOMP_TRAP_STATS: when this thread woke and had DISPATCH */
+            extern volatile uint64_t g_irq_woke_ns, g_irq_raised_ns;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            g_irq_woke_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        }
         /* ISRs and DPCs run at DISPATCH or above: raising takes the dispatch
          * lock (kernel_hal.c), so none of them runs while a game thread is in
          * a raised section. */
         pending_start_flush(0); /* threads whose creator made no further call */
         xbox_KfRaiseIrql(DISPATCH_LEVEL);
+        {
+            extern volatile uint64_t g_irq_woke_ns, g_irq_raised_ns;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            g_irq_raised_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_service_irqs(); /* device interrupts; their DPCs drain below */
         kernel_drain_dpcs();   /* deferred work, before due timers */

@@ -217,6 +217,7 @@ static void kick_submit(void);
 static void pool_release(VkImage img);
 static int s_pipe_foreign;      /* a pipeline not from pipe_get is bound */
 static int s_transfer_pending; /* see pass_barrier */
+static int s_transfer_line;    /* RECOMP_DRAW_STATS: who set it */
 
 static void garbage_add_pipe(VkPipeline pipe);
 static void garbage_add(VkImage img, VkImageView view, VkDeviceMemory mem)
@@ -292,6 +293,87 @@ static int ts_ready(void)
     return s_tsq != VK_NULL_HANDLE;
 }
 
+/* RECOMP_VK_PASS_PROF=1: GPU time per render pass, by the surface drawn
+ * into. A timestamp before each pass and at the flip; the time between two
+ * goes to the pass that started at the first (with the barriers and copies
+ * recorded after it, and any wait for the next early submit). One line per
+ * 300 frames: the costliest surfaces in ms per frame. */
+#define PP_MAX 128
+static int s_pp_on = -1;
+static VkQueryPool s_ppq;
+static uint32_t s_pp_n[VK_FRAMES], s_pp_va[VK_FRAMES][PP_MAX], s_pp_wh[VK_FRAMES][PP_MAX];
+static struct { uint32_t va, wh, n; double ms; } s_pp_acc[48];
+static uint32_t s_pp_frames;
+
+static int pp_on(void)
+{
+    if (s_pp_on < 0) {
+        const char *e = getenv("RECOMP_VK_PASS_PROF");
+        VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        s_pp_on = 0;
+        if (!(e && *e == '1') || !ts_ready())
+            return 0;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = PP_MAX * VK_FRAMES;
+        s_pp_on = vkCreateQueryPool(s_dev, &qi, NULL, &s_ppq) == VK_SUCCESS;
+        fprintf(stderr, "  [VK] pass profile %s\n", s_pp_on ? "on" : "unavailable");
+    }
+    return s_pp_on;
+}
+
+/* Outside a pass: the work from here on is va's (w, h stored). */
+static void pp_mark(uint32_t va, uint32_t w, uint32_t h)
+{
+    uint32_t k;
+    if (!pp_on() || (k = s_pp_n[s_fi]) >= PP_MAX)
+        return;
+    vkCmdWriteTimestamp(s_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_ppq, s_fi * PP_MAX + k);
+    s_pp_va[s_fi][k] = va;
+    s_pp_wh[s_fi][k] = w << 16 | h;
+    s_pp_n[s_fi] = k + 1;
+}
+
+static void pp_collect(void)
+{
+    uint64_t ts[PP_MAX];
+    uint32_t n = s_pp_n[s_fi], j, k;
+    if (n < 2 || vkGetQueryPoolResults(s_dev, s_ppq, s_fi * PP_MAX, n, sizeof ts, ts, sizeof ts[0],
+                                       VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    for (j = 0; j + 1 < n; j++) {
+        double ms = ts[j + 1] > ts[j] ? (double)(ts[j + 1] - ts[j]) * s_ts_ns / 1e6 : 0;
+        for (k = 0; k < 48 && s_pp_acc[k].n && s_pp_acc[k].va != s_pp_va[s_fi][j]; k++)
+            ;
+        if (k == 48)
+            k = 47;
+        s_pp_acc[k].va = s_pp_va[s_fi][j];
+        s_pp_acc[k].wh = s_pp_wh[s_fi][j];
+        s_pp_acc[k].n++;
+        s_pp_acc[k].ms += ms;
+    }
+    if (++s_pp_frames >= 300) {
+        double tot = 0;
+        for (k = 0; k < 48 && s_pp_acc[k].n; k++)
+            tot += s_pp_acc[k].ms;
+        fprintf(stderr, "[vk] GPU per frame %.2f ms by surface:", tot / s_pp_frames);
+        for (j = 0; j < 10; j++) {
+            uint32_t best = 48;
+            for (k = 0; k < 48 && s_pp_acc[k].n; k++)
+                if (s_pp_acc[k].ms >= 0 && (best == 48 || s_pp_acc[k].ms > s_pp_acc[best].ms))
+                    best = k;
+            if (best == 48 || s_pp_acc[best].ms / s_pp_frames < 0.05)
+                break;
+            fprintf(stderr, " %08X %ux%u %.2f ms (%.1f passes)", s_pp_acc[best].va,
+                    s_pp_acc[best].wh >> 16, s_pp_acc[best].wh & 0xFFFF,
+                    s_pp_acc[best].ms / s_pp_frames, (double)s_pp_acc[best].n / s_pp_frames);
+            s_pp_acc[best].ms = -1;
+        }
+        fprintf(stderr, "\n");
+        memset(s_pp_acc, 0, sizeof s_pp_acc);
+        s_pp_frames = 0;
+    }
+}
+
 static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -307,6 +389,8 @@ static void frame_begin(void)
                 fs_add(FS_GPU, (uint64_t)((double)(ts[1] - ts[0]) * s_ts_ns));
             s_ts_done[s_fi] = 0;
         }
+        if (s_pp_on > 0)
+            pp_collect();
         if (s_lat_slot == (int)s_fi) {
             recomp_lat_gpu_done();
             s_lat_slot = -1;
@@ -327,10 +411,15 @@ static void frame_begin(void)
         vkCmdResetQueryPool(s_cb, s_tsq, 2 * s_fi, 2);
         vkCmdWriteTimestamp(s_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_tsq, 2 * s_fi);
     }
+    s_pp_n[s_fi] = 0;
+    if (pp_on()) {
+        vkCmdResetQueryPool(s_cb, s_ppq, s_fi * PP_MAX, PP_MAX);
+        pp_mark(2, 0, 0);               /* 2: before the first pass */
+    }
     s_cb_gen++;
     s_dyn_valid = 0;
     s_kick_draws = 0;
-    s_transfer_pending = 1;
+    s_transfer_pending = 1, s_transfer_line = __LINE__;
 }
 
 /* Space in this frame's ring: returns the offset, *ptr the mapping. */
@@ -458,7 +547,7 @@ static VkDepthBuf *s_rt_depth;
  *    faces, reflection targets, ...) none.
  * Both kinds cover every image, so either one clears all the flags. */
 static int s_read_pending;
-static uint32_t s_st_bar_full, s_st_bar_gfx, s_st_bar_skip;
+static uint32_t s_st_bar_full, s_st_bar_gfx, s_st_bar_skip, s_st_pass;
 
 static void barrier_flags_clear(void)
 {
@@ -470,7 +559,11 @@ static void barrier_flags_clear(void)
     s_read_pending = 0;
 }
 
-static void barrier_all(void)
+/* RECOMP_DRAW_STATS: full barriers by the source line that asked. */
+static uint32_t s_bar_line[64][2];
+static void barrier_all_at(int line);
+#define barrier_all() barrier_all_at(__LINE__)
+static void barrier_all_at(int line)
 {
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
@@ -480,6 +573,15 @@ static void barrier_all(void)
     barrier_flags_clear();
     s_transfer_pending = 0;
     s_st_bar_full++;
+    {
+        int i;
+        for (i = 0; i < 64 && s_bar_line[i][0] && s_bar_line[i][0] != (uint32_t)line; i++)
+            ;
+        if (i < 64) {
+            s_bar_line[i][0] = (uint32_t)line;
+            s_bar_line[i][1]++;
+        }
+    }
 }
 
 /* Attachment writes -> later attachment use and fragment shader reads;
@@ -511,7 +613,7 @@ static void pass_barrier(VkSurf *s, VkDepthBuf *d)
         fprintf(stderr, "  [VK] pass barriers: %s\n", sync ? "only where needed" : "every pass");
     }
     if (!sync || s_transfer_pending)
-        barrier_all();
+        barrier_all_at(s_transfer_line ? -s_transfer_line : 0);
     else if (s_read_pending || s->dirty || s->sampled || (d && d->dirty))
         barrier_gfx();
     else
@@ -601,7 +703,9 @@ static void begin_rendering(VkSurf *s, VkDepthBuf *d)
         ri.pDepthAttachment = &da;
         ri.pStencilAttachment = &da;
     }
+    pp_mark(s->va, s->pw, s->ph);
     p_begin_rendering(s_cb, &ri);
+    s_st_pass++;
     s_in_render = 1;
     s_rt = s;
     s_rt_depth = d;
@@ -877,7 +981,7 @@ static void clear_image_color(VkImage img, float r, float g, float b, float a)
                                    VK_REMAINING_ARRAY_LAYERS };
     end_rendering();
     vkCmdClearColorImage(s_cb, img, VK_IMAGE_LAYOUT_GENERAL, &c, 1, &rg);
-    s_transfer_pending = 1;
+    s_transfer_pending = 1, s_transfer_line = __LINE__;
 }
 
 static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t aa_sy)
@@ -971,7 +1075,7 @@ static void rescale_surfaces(double k)
         bl.dstOffsets[1].z = 1;
         vkCmdBlitImage(s_cb, s->image, VK_IMAGE_LAYOUT_GENERAL, img,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
-        s_transfer_pending = 1;
+        s_transfer_pending = 1, s_transfer_line = __LINE__;
         garbage_add(s->image, s->view, s->mem);
         s->image = img; s->view = view; s->mem = mem;
         s->pw = pw; s->ph = ph;
@@ -1308,7 +1412,7 @@ static void tex_copy_from_ring(VkTex *t, VkDeviceSize at, uint32_t row_texels,
     rg.imageExtent.height = t->h >> level ? t->h >> level : 1;
     rg.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(s_cb, s_f->ring, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
-    s_transfer_pending = 1;
+    s_transfer_pending = 1, s_transfer_line = __LINE__;
 }
 
 /* Copy `bytes` at `src` (row length `row_texels`, 0 = tight) into the image. */
@@ -1353,7 +1457,7 @@ static void gen_mips(VkImage img, uint32_t w, uint32_t h, uint32_t levels, uint3
         bl.dstOffsets[1].z = 1;
         vkCmdBlitImage(s_cb, img, VK_IMAGE_LAYOUT_GENERAL, img,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
-        s_transfer_pending = 1;
+        s_transfer_pending = 1, s_transfer_line = __LINE__;
     }
 }
 
@@ -1606,6 +1710,7 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
             continue;
         if (!copied) {
             end_rendering();
+            pp_mark(6, size, size);     /* 6: a cube map from surfaces */
             barrier_all();
             copied = 1;
         }
@@ -1623,7 +1728,7 @@ static VkImageView cube_from_surfaces(uint32_t va, uint32_t w, uint32_t h, uint3
         bl.dstOffsets[1].z = 1;
         vkCmdBlitImage(s_cb, sf->image, VK_IMAGE_LAYOUT_GENERAL, c->image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
-        s_transfer_pending = 1;
+        s_transfer_pending = 1, s_transfer_line = __LINE__;
         c->src[f] = sf;
         c->gen[f] = sf->gen;
     }
@@ -1662,6 +1767,7 @@ static VkImageView self_snapshot(VkSurf *sf)
     if (s_snap_va == sf->va && s_snap_gen == sf->gen && s_snap_cb == s_cb_gen)
         return s_snap_view;
     end_rendering();
+    pp_mark(5, sf->pw, sf->ph);         /* 5: a self-sample snapshot */
     barrier_all();
     memset(&cp, 0, sizeof cp);
     cp.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1939,6 +2045,7 @@ static VkImageView depth_as_color(VkDepthBuf *d, uint32_t fmt)
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
+    pp_mark(3, d->pw, d->ph);           /* 3: depth pre-pass */
     p_begin_rendering(s_cb, &ri);
     vkCmdBindPipeline(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_zc_pipe);
     vkCmdSetViewport(s_cb, 0, 1, &vp);
@@ -3498,7 +3605,7 @@ static void flush_frame_wait(void)
     vkBeginCommandBuffer(s_cb, &bi);
     s_cb_gen++;
     s_dyn_valid = 0;
-    s_transfer_pending = 1;
+    s_transfer_pending = 1, s_transfer_line = __LINE__;
 }
 
 /* ── Early submits (RECOMP_VK_KICK, nfsu1-sw) ─────────────────────────
@@ -3556,7 +3663,7 @@ static void kick_submit(void)
     s_dyn_valid = 0;
     s_kick_draws = 0;
     s_st_kicks++;
-    s_transfer_pending = 1;
+    s_transfer_pending = 1, s_transfer_line = __LINE__;
 }
 
 /* ── Render state ─────────────────────────────────────────────────── */
@@ -4220,6 +4327,7 @@ static struct {
 static int s_inst_on = -1, s_inst_alt;
 static uint32_t s_inst_why[9];          /* 0 appended or held, 1 regs, 2 full, 3 cb, 4 shape, 5 tex, 6 gen, 7 vertices, 8 other */
 static uint32_t s_st_draws, s_st_calls, s_st_inst, s_st_creuse;
+static uint64_t s_st_idx;               /* indices drawn (RECOMP_DRAW_STATS) */
 
 static void pend_flush(void)
 {
@@ -4442,8 +4550,19 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
      * every bright car body. The NV2A reads what was there before the draw,
      * so it samples a copy of that. */
     for (i = 0; i < 4; i++)
-        if (sampled[i] && sampled[i] == s)
+        if (sampled[i] && sampled[i] == s) {
+            static unsigned told;
+            if (s_inst_why_on && told < 24) {
+                told++;
+                LOGE("self-sample: frame %u surface %08X %ux%u (stored %ux%u), stage %u tex %08X"
+                     " fmt %08X rect %08X, prim %u, %u verts, blend %u %X/%X, color mask %08X,"
+                     " zeta %08X, prog %08X\n", s_frame, s->va, s->w, s->h, s->pw, s->ph, i,
+                     r[(0x1B00 + i * 64) / 4], r[(0x1B04 + i * 64) / 4], r[(0x1B1C + i * 64) / 4],
+                     b->prim, b->vertex_count, r[0x304 / 4], r[0x344 / 4], r[0x348 / 4],
+                     r[0x358 / 4], b->zeta_va, r[0x1E70 / 4]);
+            }
             img[i].imageView = self_snapshot(s);
+        }
     for (i = 0; i < 4; i++)
         if (sampled[i] && sampled[i]->dirty && sampled[i] != s) {
             end_rendering();                 /* next begin_rendering barriers */
@@ -4626,6 +4745,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     push_draw_descriptors(wr);
 
     VT("  vkCmdDrawIndexed %u\n", n);
+    s_st_idx += n;
     /* The constants were the ring's last allocation, so a repeat's set
      * lands right behind them (pend_append). */
     if (pend_eligible(b) && inst_room > 1) {
@@ -5306,6 +5426,7 @@ static int present_fxaa(VkSurf *s, VkImage dst, VkImageView dview, VkFormat fmt,
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
+    pp_mark(4, 0, 0);                   /* 4: the present pass (FXAA, overlay) */
     p_begin_rendering(s_cb, &ri);
     vkCmdBindPipeline(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdSetViewport(s_cb, 0, 1, &vp);
@@ -5577,13 +5698,25 @@ static void vk_flip(void)
             {
                 uint32_t nf = s_frame - st_frame;
                 fprintf(stderr, "[vk] per frame: %u draws -> %u draw calls (%u instances appended);"
+                        " %u passes, %u early submits; %llu indices;"
                         " barriers %u full, %u gfx, %u skipped; uniforms %u reused, %u new;"
                         " constants %u reused; descriptors %u pushed, %u kept\n",
                         s_st_draws / nf, s_st_calls / nf, s_st_inst / nf,
+                        s_st_pass / nf, s_st_kicks / nf, (unsigned long long)(s_st_idx / nf),
                         s_st_bar_full / nf, s_st_bar_gfx / nf, s_st_bar_skip / nf,
                         s_st_uhit / nf, s_st_umiss / nf, s_st_chit / nf,
                         s_st_desc / nf, s_st_desc_saved / nf);
-                s_st_bar_full = s_st_bar_gfx = s_st_bar_skip = 0;
+                {
+                    int i;
+                    fprintf(stderr, "[vk] full barriers by line (negative: a pass after the transfer there):");
+                    for (i = 0; i < 64 && s_bar_line[i][0]; i++)
+                        if (s_bar_line[i][1] >= nf)
+                            fprintf(stderr, " %d x%u", (int)s_bar_line[i][0], s_bar_line[i][1] / nf);
+                    fprintf(stderr, "\n");
+                    memset(s_bar_line, 0, sizeof s_bar_line);
+                }
+                s_st_bar_full = s_st_bar_gfx = s_st_bar_skip = s_st_pass = s_st_kicks = 0;
+                s_st_idx = 0;
                 s_st_uhit = s_st_umiss = s_st_chit = s_st_desc = s_st_desc_saved = 0;
             }
             {
@@ -5818,6 +5951,7 @@ static void vk_flip(void)
         }
     }
     VT("flip %u: submit (image %d)\n", s_frame, have_image);
+    pp_mark(1, 0, 0);                   /* 1: the end of the frame */
     if (s_ts_began[s_fi]) {
         vkCmdWriteTimestamp(s_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_tsq, 2 * s_fi + 1);
         s_ts_began[s_fi] = 0;

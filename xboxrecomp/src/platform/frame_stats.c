@@ -74,12 +74,114 @@ static int thread_cpu_ns(int i, uint64_t *ns)
 static void hint_thread(int which);
 #endif
 
+#if defined(__ANDROID__)
+/* RECOMP_PROF=1: a sampling profiler without perf events (a user build
+ * forbids them). Each fs_thread thread gets a timer on its own CPU clock,
+ * 1000 Hz; SIGPROF records the interrupted pc. Every 10 s prof.txt in the
+ * current folder (the log's) gets "thread offset count" lines, offsets into
+ * libmain.so: llvm-symbolizer on out/android/symbols/libmain.so names them. */
+#include <signal.h>
+#include <ucontext.h>
+
+#define PROF_N (1u << 17)
+static uintptr_t s_prof_pc[FS_T_N][PROF_N];
+static volatile uint32_t s_prof_n[FS_T_N];
+static __thread int t_prof_which = -1;
+static uintptr_t s_prof_base;
+static int s_prof_on = -1;
+
+static void prof_sig(int sig, siginfo_t *si, void *ctx)
+{
+    int w = t_prof_which;
+    uint32_t k;
+    (void)sig; (void)si;
+    if (w < 0)
+        return;
+    k = s_prof_n[w];
+    if (k < PROF_N) {
+        s_prof_pc[w][k] = (uintptr_t)((ucontext_t *)ctx)->uc_mcontext.pc;
+        s_prof_n[w] = k + 1;
+    }
+}
+
+static void prof_thread(int which)
+{
+    struct sigevent sev;
+    struct itimerspec its;
+    timer_t tm;
+    if (s_prof_on < 0) {
+        const char *e = getenv("RECOMP_PROF");
+        Dl_info di;
+        s_prof_on = e && *e == '1';
+        if (s_prof_on) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = prof_sig;
+            sa.sa_flags = SA_SIGINFO | SA_RESTART;
+            sigaction(SIGPROF, &sa, NULL);
+            if (dladdr((void *)prof_thread, &di))
+                s_prof_base = (uintptr_t)di.dli_fbase;
+            fprintf(stderr, "[prof] sampling at 1000 Hz of thread CPU time, prof.txt every 10 s\n");
+        }
+    }
+    if (!s_prof_on || which == FS_T_PRES)
+        return;
+    t_prof_which = which;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_THREAD_ID;
+    sev.sigev_signo = SIGPROF;
+    sev.sigev_notify_thread_id = gettid();
+    if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &tm))
+        return;
+    its.it_interval.tv_sec = 0;
+    its.it_interval.tv_nsec = 1000000;
+    its.it_value = its.it_interval;
+    timer_settime(tm, 0, &its, NULL);
+}
+
+static int cmp_up(const void *a, const void *b)
+{
+    uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void prof_dump(void)
+{
+    static uint64_t last;
+    static uintptr_t buf[PROF_N];
+    uint64_t now = mono_ns();
+    FILE *f;
+    int w;
+    if (s_prof_on <= 0 || now - last < 10000000000ull)
+        return;
+    last = now;
+    if (!(f = fopen("prof.txt", "a")))
+        return;
+    fprintf(f, "# window\n");
+    for (w = 0; w < FS_T_PRES; w++) {
+        uint32_t n = s_prof_n[w], i, j;
+        memcpy(buf, s_prof_pc[w], n * sizeof buf[0]);
+        s_prof_n[w] = 0;
+        for (i = 0; i < n; i++)
+            buf[i] = buf[i] >= s_prof_base ? buf[i] - s_prof_base : 0;
+        qsort(buf, n, sizeof buf[0], cmp_up);
+        for (i = 0; i < n; i = j) {
+            for (j = i; j < n && buf[j] == buf[i]; j++)
+                ;
+            fprintf(f, "%s %lx %u\n", k_tname[w], (unsigned long)buf[i], j - i);
+        }
+    }
+    fclose(f);
+}
+#endif
+
 void fs_thread(int which)
 {
     if (which < 0 || which >= FS_T_N)
         return;
 #if defined(__ANDROID__)
     hint_thread(which);
+    prof_thread(which);
 #endif
     if (!fs_on())
         return;
@@ -281,6 +383,7 @@ void fs_frame(unsigned draws, unsigned programs, unsigned textures)
         if (hint_last)
             hint_frame(t, hint_last);
         hint_last = t;
+        prof_dump();
     }
 #endif
     if (!fs_on())

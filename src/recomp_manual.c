@@ -182,11 +182,44 @@ void sub_0053C190(void)
         }
         {   /* RECOMP_FRAME_STATS: the game thread's wait for GPU progress */
             struct timespec t0, t1;
+            uint64_t ns;
+            uint32_t ret = MEM32(esp);
             clock_gettime(CLOCK_MONOTONIC, &t0);
             sub_0053C190_gen();
             clock_gettime(CLOCK_MONOTONIC, &t1);
-            fs_add(FS_GAME_WAIT, (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull
-                                 + (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec);
+            ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ull
+                 + (uint64_t)t1.tv_nsec - (uint64_t)t0.tv_nsec;
+            fs_add(FS_GAME_WAIT, ns);
+            {
+                /* CLX_WAIT_LOG=1: every 5 s, the wait by caller. */
+                static int on = -1;
+                static uint32_t site[8], cnt[8];
+                static uint64_t tot[8], last;
+                int k;
+                if (on < 0) {
+                    const char *e = getenv("CLX_WAIT_LOG");
+                    on = e && *e == '1';
+                }
+                if (on) {
+                    for (k = 0; k < 8 && site[k] && site[k] != ret; k++)
+                        ;
+                    if (k < 8) {
+                        site[k] = ret;
+                        cnt[k]++;
+                        tot[k] += ns;
+                    }
+                    if (t1.tv_sec - last >= 5) {
+                        last = t1.tv_sec;
+                        fprintf(stderr, "[wait] by caller:");
+                        for (k = 0; k < 8 && site[k]; k++)
+                            fprintf(stderr, " %08X x%u %.1f ms", site[k], cnt[k], tot[k] / 1e6);
+                        fprintf(stderr, "\n");
+                        memset(site, 0, sizeof site);
+                        memset(cnt, 0, sizeof cnt);
+                        memset(tot, 0, sizeof tot);
+                    }
+                }
+            }
         }
         return;
     }

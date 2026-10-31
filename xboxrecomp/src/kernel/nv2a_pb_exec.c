@@ -4352,6 +4352,11 @@ void nv2a_pb_trap_taken(void)
  * by the title's handler wrapper): delivery, handler, executor wake-up. */
 static uint64_t s_trap_wait_ns, s_trap_wait_max_ns, s_trap_waits;
 static uint64_t s_trap_deliver_ns, s_trap_handler_ns, s_trap_wake_ns;
+/* The interrupt thread's wake and DISPATCH (kernel_bridge.c), to split the
+ * delivery: thread wake-up, the dispatch lock, then the guest lock. */
+volatile uint64_t g_irq_woke_ns, g_irq_raised_ns, g_irq_idle_ns;
+static uint64_t s_trap_d_wake_ns, s_trap_d_raise_ns, s_trap_d_gil_ns, s_trap_d_n;
+static uint64_t s_trap_busy_n;     /* posted while the thread was still busy */
 static volatile uint64_t s_trap_in_ns, s_trap_out_ns;
 static uint64_t trap_now_ns(void)
 {
@@ -4387,6 +4392,11 @@ static void trap_deliver_hooked(volatile uint32_t *nv, uint32_t method,
     nv[0x000100 / 4] |= 0x1000;                    /* PMC_INTR_0: PGRAPH */
     InterlockedExchange(&s_trap_lock, 0);
     xbox_set_irq_line(3, 1);
+    {
+        uint64_t idle = g_irq_idle_ns, wk = g_irq_woke_ns;
+        if (wk > idle)                  /* not back at its wait yet */
+            s_trap_busy_n++;
+    }
     /* PGRAPH stalls until the driver has taken the trap, however long. */
     while (!InterlockedCompareExchange(&s_trap_taken, 0, 0)) {
         /* Level, like the hardware: asserted until taken. The ack thread may
@@ -4409,13 +4419,31 @@ static void trap_deliver_hooked(volatile uint32_t *nv, uint32_t method,
                 xbox_IrqlDumpHolders();
             }
         }
-        WaitForSingleObject(driver_event(), 1);
+        {
+            /* Poll a while before sleeping (RECOMP_IRQ_SPIN, kernel_bridge.c):
+             * the handler takes microseconds, the wake-up from the event
+             * took ~25 us more on Android. */
+            extern uint64_t xbox_irq_spin_ns(void);
+            uint64_t spin = xbox_irq_spin_ns(), ts0 = trap_now_ns();
+            while (spin && !InterlockedCompareExchange(&s_trap_taken, 0, 0)
+                   && trap_now_ns() - ts0 < spin)
+                ;
+            if (!InterlockedCompareExchange(&s_trap_taken, 0, 0))
+                WaitForSingleObject(driver_event(), 1);
+        }
     }
     xbox_set_irq_line(3, 0);
     {
         uint64_t t1 = trap_now_ns(), dt = t1 - t0;
         uint64_t in = s_trap_in_ns, out = s_trap_out_ns;
         if (in >= t0 && out >= in && t1 >= out) {
+            uint64_t wk = g_irq_woke_ns, rs = g_irq_raised_ns;
+            if (wk >= t0 && rs >= wk && in >= rs) {
+                s_trap_d_wake_ns += wk - t0;
+                s_trap_d_raise_ns += rs - wk;
+                s_trap_d_gil_ns += in - rs;
+                s_trap_d_n++;
+            }
             s_trap_deliver_ns += in - t0;
             s_trap_handler_ns += out - in;
             s_trap_wake_ns += t1 - out;
@@ -4545,6 +4573,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     fprintf(stderr, "  [PB] trap split: delivery %.1f ms, handler %.1f ms, executor wake %.1f ms\n",
                             s_trap_deliver_ns / 1e6, s_trap_handler_ns / 1e6, s_trap_wake_ns / 1e6);
                     s_trap_wait_ns = s_trap_wait_max_ns = s_trap_waits = 0;
+                    fprintf(stderr, "  [PB] delivery split (%llu traps woken for it): thread wake %.1f ms,"
+                            " dispatch lock %.1f ms, guest lock and ISR entry %.1f ms\n",
+                            (unsigned long long)s_trap_d_n, s_trap_d_wake_ns / 1e6,
+                            s_trap_d_raise_ns / 1e6, s_trap_d_gil_ns / 1e6);
+                    fprintf(stderr, "  [PB] traps posted while the interrupt thread was still busy: %llu\n",
+                            (unsigned long long)s_trap_busy_n);
+                    s_trap_busy_n = 0;
+                    s_trap_d_wake_ns = s_trap_d_raise_ns = s_trap_d_gil_ns = s_trap_d_n = 0;
                     s_trap_deliver_ns = s_trap_handler_ns = s_trap_wake_ns = 0;
                     memset(cnt, 0, sizeof cnt);
                     next = GetTickCount64() + 10000;

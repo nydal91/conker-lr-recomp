@@ -30,6 +30,9 @@
         android:extractNativeLibs="true"
         android:largeHeap="true">
 
+        <!-- simpleperf from adb can attach to a release build (CPU profiles). -->
+        <profileable android:shell="true" />
+
         <!-- Game Mode: Performance can be picked for the game (res/xml/game_mode_config.xml). -->
         <meta-data android:name="android.game_mode_config"
             android:resource="@xml/game_mode_config" />
